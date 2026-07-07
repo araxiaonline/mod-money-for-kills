@@ -79,6 +79,9 @@ reward range of the group and an option to only reward the player that got the k
 #include "Chat.h"
 #include "Player.h"
 #include "Guild.h"
+#include "WorldSessionMgr.h"
+#include <algorithm>
+#include <cmath>
 
 enum KillType
 {
@@ -105,6 +108,8 @@ static constexpr const char* MFKBountyKillMult = "MFK.Bounty.Kill.Multiplier";
 static constexpr const char* MFKPVPKillMult = "MFK.PVP.Kill.Multiplier";
 static constexpr const char* MFKBountyKillDBMult = "MFK.Bounty.DungeonBoss.Multiplier";
 static constexpr const char* MFKBountyKillWBMult = "MFK.Bounty.WorldBoss.Multiplier";
+static constexpr const char* MFKKillerLevelDiffEnable = "MFK.Killer.Level.Diff.Enable";
+static constexpr const char* MFKMaxGoldThreshold = "MFK.Max.Gold.Threshold";
 
 class MoneyForKills : public PlayerScript
 {
@@ -112,7 +117,7 @@ public:
 	MoneyForKills() : PlayerScript("MoneyForKills") { }
 
 	// Announce Module
-	void OnLogin(Player *player) {
+	void OnPlayerLogin(Player *player) override {
 		if (sConfigMgr->GetOption<bool>(MFKEnable, true))
 		{
 			if (sConfigMgr->GetOption<bool>(MFKAnnounce, true))
@@ -122,15 +127,52 @@ public:
 		}
 	}
 
+void OnPlayerKilledByCreature(Creature* killer, Player* killed){
+    if (!killer || !killed)
+        return;
+    Unit* owner = killer->GetOwner();
+    if (!owner)
+        return;
+    Player* petOwner = owner->ToPlayer();
+    if (!petOwner)
+        return;
+    if (petOwner == killed)
+        return;
+    MoneyForKills::OnPlayerPVPKill(petOwner, killed);
+}
 	// Player Kill Reward
-	void OnPVPKill(Player* killer, Player* victim)
+	void OnPlayerPVPKill(Player* killer, Player* victim) override
 	{
 		// If enabled...
 		if (sConfigMgr->GetOption<bool>(MFKEnable, true))
 		{
+			//A coefficient to adjust the gold given for bounties
 			const uint32 PVPMultiplier = sConfigMgr->GetOption<uint32>(MFKPVPKillMult, 0);
 			const uint32 VictimLevel = victim->GetLevel();
-
+			const uint32 KillerLevel = killer->GetLevel();
+			//Gold of the victim before calculation
+			const uint32 VictimGold = victim->GetMoney();
+			//Scales the reward depending on the proportional difference in level if enabled
+            float KillerLevelDiff = 1.0f;
+			//adding an enable system to choose the multiplier applied
+			if (sConfigMgr->GetOption<bool>(MFKKillerLevelDiffEnable, true))
+			{
+				KillerLevelDiff = static_cast<float>(VictimLevel) / static_cast<float>(KillerLevel);
+			}
+			//Maximum percentage of victim gold which can be taken. Maximum allowable value is 100%.
+			const float MaxLootPercentage = std::min(1.0f,sConfigMgr->GetOption<float>(MFKMaxGoldThreshold, 1.0f));
+			// Calculate the percentage of gold to transfer from victim to killer. Maximum alloable is whatever was set in MaxLootPercentage.
+			const float PVPCorpseLootPercent = std::min((sConfigMgr->GetOption<uint32>(MFKPVPCorpseLootPercent, 5)/100.0f)*KillerLevelDiff,MaxLootPercentage);
+			// Calculate the percentage of victim gold to be transferred
+			const uint32 VictimLoot = static_cast<uint32>(VictimGold * PVPCorpseLootPercent);
+			//only notify if a value is being transferred
+			if (VictimLoot > 0){
+				// Rifle the victim's corpse for loot
+				killer->ModifyMoney(VictimLoot);
+				victim->ModifyMoney(-VictimLoot);
+				// Inform the player of the corpse loot
+				Notify(killer, victim, nullptr, KILLTYPE_LOOT, VictimLoot);
+			}
 			// If enabled...
 			if (PVPMultiplier > 0)
 			{
@@ -140,36 +182,18 @@ public:
 					Notify(killer, victim, nullptr, KILLTYPE_SUICIDE, 0);
 					return;
 				}
-
-				const int BountyAmount = ((VictimLevel * PVPMultiplier) / 3);
-
+				//Added in the KillerLevelDiff so bounties are not awarded for farming low level players.
+				const int BountyAmount = ((VictimLevel * PVPMultiplier * KillerLevelDiff) / 3);
 				// Pay the player the additional PVP bounty
 				killer->ModifyMoney(BountyAmount);
 				// Inform the player of the bounty amount
 				Notify(killer, victim, nullptr, KILLTYPE_PVP, BountyAmount);
 			}
 
-			// Calculate the amount of gold to give to the victor
-			const uint32 PVPCorpseLootPercent = sConfigMgr->GetOption<uint32>(MFKPVPCorpseLootPercent, 5);
-			const int VictimLoot = (victim->GetMoney() * PVPCorpseLootPercent) / 100;
-
-			// Rifle the victim's corpse for loot
-			if (victim->GetMoney() >= 10000 && VictimLoot > 0)
-			{
-				// Player loots a percentage of the victim's gold
-				killer->ModifyMoney(VictimLoot);
-				victim->ModifyMoney(-VictimLoot);
-
-				// Inform the player of the corpse loot
-				Notify(killer, victim, nullptr, KILLTYPE_LOOT, VictimLoot);
-			}
-
-			return;
-		}
-	}
+	}}
 
 	// Creature Kill Reward
-	void OnCreatureKill(Player* player, Creature* killed)
+	void OnPlayerCreatureKill(Player* player, Creature* killed) override
 	{
 		// If enabled...
 		if (sConfigMgr->GetOption<bool>(MFKEnable, true))
@@ -300,7 +324,7 @@ public:
 			{
 				rewardMsg.append("|cff676767[ |cffFFFF00World |cff676767]|r:|cff4CFF00 ").append(killer->GetName()).append(" |cffFF0000has slain ");
 				rewardMsg.append(victim->GetName()).append(" earning a bounty of").append(rewardVal).append(".");
-				sWorld->SendServerMessage(SERVER_MSG_STRING, rewardMsg.c_str());
+				sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, rewardMsg.c_str());
 			}
 			break;
 		case KILLTYPE_DUNGEONBOSS:
@@ -316,7 +340,7 @@ public:
 			{
 				rewardMsg.append("|cffFF0000[ |cffFFFF00World |cffFF0000]|r:|cff4CFF00 ").append(killer->GetName());
 				rewardMsg.append("'s|r group triumphed victoriously over |CFF18BE00[").append(killed->GetName()).append("]|r !");
-				sWorld->SendServerMessage(SERVER_MSG_STRING, rewardMsg.c_str());
+				sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, rewardMsg.c_str());
 				rewardMsg.clear();
 			}
 			break;
@@ -328,7 +352,7 @@ public:
 			message.append(" met an untimely demise!");
 
 			if (sConfigMgr->GetOption<bool>(MFKAnnounceWorldSuicide, true))
-				sWorld->SendServerMessage(SERVER_MSG_STRING, message.c_str());
+				sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, message.c_str());
 
 			if (sConfigMgr->GetOption<bool>(MFKAnnounceGuildSuicide, false))
 			{
